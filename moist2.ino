@@ -1,4 +1,13 @@
 /*********************
+ * 
+ *   Arduino Diecimila based Humidfier 
+ *     - Adafruit RGB LCD (i2c)
+ *     - ACE power strip remote control -- used to
+ *       wirelessly turn on and off mist maker and fan
+ *     - AM2315 temperature and humidity sensor 
+ *     - several buttons used for interface -- most are connected to 
+ *       LCD board except reset and select
+ *       
 Borrowed code from:
 1. Adafruit RGB Character LCD Shield example 
    (with noted fix to process button clicks)
@@ -7,7 +16,6 @@ Borrowed code from:
     info on the web regarding getting stable data)
 3. remote power code from my cabin/FRANK code
 
-Future: upgrade to replace relays with optoisolators from FRANK
 **********************/
 
 // include the library code:
@@ -17,7 +25,8 @@ Future: upgrade to replace relays with optoisolators from FRANK
 #include <Adafruit_AM2315.h>
 // code for dealing with button directly wired to arduino (debounce logic)
 #include <Bounce2.h>
-
+// added watch dog functionality to have board reset on hard errors
+#include <avr/wdt.h>  
 
 //#define DEBUG 1
 
@@ -25,14 +34,15 @@ Future: upgrade to replace relays with optoisolators from FRANK
 // we missed turning off the remote until we add feedback
 // we repeat the toggle to improve reliability
 #define REPEAT_REMOTE_TOGGLE 1
-    
+// #define AM2315_VCC_CTL
+
 // global constants 
-const char  VERSION[] = "MOIST v0.4";
+const char  VERSION[] = "MOIST v0.10";
 const int CONFIG_NUM = 3;
-const float CONFIG_0_DEFAULT_MIN_HUMIDITY=50.0;
-const float CONFIG_0_DEFAULT_MAX_HUMIDITY=60.0;
-const float CONFIG_1_DEFAULT_MIN_HUMIDITY=30.0;
-const float CONFIG_1_DEFAULT_MAX_HUMIDITY=40.0;
+const float CONFIG_1_DEFAULT_MIN_HUMIDITY=50.0;
+const float CONFIG_1_DEFAULT_MAX_HUMIDITY=60.0;
+const float CONFIG_0_DEFAULT_MIN_HUMIDITY=30.0;
+const float CONFIG_0_DEFAULT_MAX_HUMIDITY=40.0;
 const float CONFIG_2_DEFAULT_MIN_HUMIDITY=0.0;
 const float CONFIG_2_DEFAULT_MAX_HUMIDITY=0.0;
 const int8_t CONFIG_SYM_COL=15;
@@ -43,14 +53,20 @@ const int8_t LCD_NUM_ROWS=2;
 const int8_t LCD_OFF=0x0;
 const int8_t LCD_ON=0x7;
 
+const int AM2315_POWER_CYCLE_DELAY=1000*10;  // keep AM2315 off for 10 seconds to power cycle
 const int AM2315_DELAY=2000;        // min 2 second delay between queries
                                     // to get stable data
 const int AM2315_ERROR_THRESHOLD=1;
 const int UPDATE_SENSOR_DATA_PERIOD=(AM2315_DELAY * 15);
 
-const int8_t EXTRA_BUTTON_PIN=5;    // WIRING CONSTRAINT
-const int8_t REMOTE_ON_PIN=6;       // WIRING CONSTRAINT
-const int8_t REMOTE_OFF_PIN=7;      // WIRING CONSTRAINT
+#ifdef AM2315_VCC_CTL
+const int8_t AM2315_VCC_PIN=4;           // WIRING CONSTRAINT 5v VCC RED AM2315
+#endif
+
+const int8_t EXTRA_BUTTON_PIN=5;    // WIRING CONSTRAINT ORANGE FROM SEL BUTTON
+const int8_t REMOTE_ON_PIN=6;       // WIRING CONSTRAINT ORANGE FROM REMOTE 
+const int8_t REMOTE_OFF_PIN=7;      // WIRING CONSTRAINT YELLOW FROM REMOTE
+
 const int    REMOTE_TOGGLE_DELAY=2000;  
 const int8_t REMOTE_STATUS_COL=15;
 const int8_t REMOTE_STATUS_ROW=0;
@@ -125,6 +141,27 @@ struct GLOBALSTATE {
                   }                   
 } State;
 
+void AM2315_error(char *,bool);
+
+//this makes sure the WDT is reset immediately when entering the
+//function, but we can still benefit from a real 'delay'.
+//upon leaving the function, we reset it again.
+//i realize timing will be loose, you can always do something with
+//millies() if you need strict timing.
+//you might also need to adjust the '1000' if you WDT is shorter
+
+void wdt_delay(unsigned long msec) {
+  wdt_reset();
+
+  while(msec > 1000) {
+    wdt_reset();
+    delay(1000);
+    msec -= 1000;
+  }
+  delay(msec);
+  wdt_reset();
+}
+
 void
 backLightOn() 
 {
@@ -171,16 +208,16 @@ inline void
 remote_toggle_button(int pin)
 {
     digitalWrite(pin, HIGH);
-    delay(REMOTE_TOGGLE_DELAY);
+    wdt_delay(REMOTE_TOGGLE_DELAY);
     digitalWrite(pin, LOW);
-    delay(REMOTE_TOGGLE_DELAY);
+    wdt_delay(REMOTE_TOGGLE_DELAY);
 #ifdef REPEAT_REMOTE_TOGGLE
     // to improve reliability
-    delay(500);
+    wdt_delay(500);
     digitalWrite(pin, HIGH);
-    delay(REMOTE_TOGGLE_DELAY);
+    wdt_delay(REMOTE_TOGGLE_DELAY);  wdt_reset();
     digitalWrite(pin, LOW);
-    delay(REMOTE_TOGGLE_DELAY); 
+    wdt_delay(REMOTE_TOGGLE_DELAY); wdt_reset();
 #endif
 }
 
@@ -237,8 +274,42 @@ displayMinMax()
   }
 }
 
+
+inline void 
+AM2315_setup()
+{
+#ifdef AM2315_VCC_CTL
+    pinMode(AM2315_VCC_PIN, OUTPUT);
+    digitalWrite(AM2315_VCC_PIN, HIGH);
+#endif
+}
+
 void 
-error(char *msg)
+AM2315_reset() 
+{
+
+   // TOGGLE AM2315 POWER
+#ifdef AM2315_VCC_CTL   
+   digitalWrite(AM2315_VCC_PIN, LOW);
+   wdt_delay(AM2315_POWER_CYCLE_DELAY);   // keep it off for 10 seconds 
+   digitalWrite(AM2315_VCC_PIN, HIGH); 
+#endif
+
+     if (! State.am2315.begin()) { 
+        AM2315_error((char *)" ERROR: AM2315-0", true);  // hard error stop execution
+     }
+     
+     State.lastHum = millis(); // setup times so first read will be 
+     wdt_delay(AM2315_DELAY);  // at least after AM2315 delay
+}
+
+
+// On AM2315 error -- default errors are fatal (hard=true)
+//    print message and turn off remote and hang execution
+// When we can actually reset AM2315 meaningfully we can 
+// try making errors soft and reset the AM2315 
+void 
+AM2315_error(char *msg, bool hard=true)
 {
 #ifdef DEBUG
      Serial.println("Sensor not found, check wiring & pullups!");
@@ -250,20 +321,23 @@ error(char *msg)
      
      remote_pwr_off();  // polietly try and turn off remote power
      remote_toggle_button(REMOTE_OFF_PIN); // to be safe do it forcefully;
- 
-     while (1);
+
+     if (hard)  { while(1); }
+     else {  AM2315_reset();  } // now lets try reseting te 
 }
 
 bool 
 updateHumTemp()
 {
-  if (State.am2315.readTemperatureAndHumidity(State.temp, State.hum)) {    
+  if (State.am2315.readTemperatureAndHumidity(State.temp, State.hum)) {   
+      State.lcd.setCursor(0, 0); // COL=0, ROW=0 
       State.lcd.print(State.hum); State.lcd.print("% "); 
       State.lcd.print(State.temp); State.lcd.print("C");
+      if (State.am2315Errors>0) State.lcd.print(State.am2315Errors);
       return true;
   } else {
     State.am2315Errors++;
-    if (State.am2315Errors == AM2315_ERROR_THRESHOLD) error((char *)" ERROR: AM2315-1");
+    if (State.am2315Errors == AM2315_ERROR_THRESHOLD) AM2315_error((char *)" ERROR: AM2315-1");
   }
   return false;
 }
@@ -275,7 +349,8 @@ setup()
 #ifdef DEBUG
   Serial.begin(9600);
 #endif
-
+  wdt_disable();
+  
   // set up the LCD's number of columns and rows: 
   State.lcd.begin(LCD_NUM_COLS, LCD_NUM_ROWS);
 
@@ -292,14 +367,15 @@ setup()
   State.lcd.setCursor(0,1); // COL=0, ROW=1
   State.lcd.print("SETUP HUM & TEMP");
   
-  if (! State.am2315.begin()) { error((char *)" ERROR: AM2315-0"); }
- 
-  State.lastHum = millis(); // setup times so first read will be 
-  delay(AM2315_DELAY);      // at least after AM2315 delay   
   
   State.lcd.clear();        // clear lcd
   displayMinMax();          // display min max
+  
+  AM2315_setup();
+  AM2315_reset();
+  
   updateHumTemp();          // get and display current humdity and temp
+  wdt_enable(WDTO_8S); //enable it, and set it to 8s
 }
 
 inline void 
@@ -355,8 +431,7 @@ processSensors()
   State.now = millis();
   if ((State.now-State.lastHum) >= UPDATE_SENSOR_DATA_PERIOD) {
     State.lastHum = State.now;
-    State.lcd.setCursor(0, 0); // COL=0, ROW=0
-   if (updateHumTemp()) { 
+    if (updateHumTemp()) { 
       if (State.hum <= State.configs[State.theConfig].humMin) remote_pwr_on();
       else if (State.hum > State.configs[State.theConfig].humMax) remote_pwr_off();
     }   
@@ -365,6 +440,7 @@ processSensors()
 
 void 
 loop() {
+  wdt_reset();
   processButtons();
   processSensors();  
 }
